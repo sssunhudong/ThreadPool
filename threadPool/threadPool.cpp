@@ -1,148 +1,134 @@
-#pragma once
-#include <windows.h>
-#include <list>
-#include <queue>
-#include <memory>
+#include "threadPool.h"
+#include <process.h>
 
-using std::list;
-using std::queue;
-using std::shared_ptr;
-
-#define THRESHOLE_OF_WAIT_TASK 20
-
-typedef int(*TaskFun)(PVOID param);			//任务函数
-typedef void(*TaskCallbackFun)(int result); //回调函数
-
-class ThreadPool
+ThreadPool::ThreadPool(size_t minNumOfThread, size_t maxNumOfThread)
 {
-private:
-	//线程类（内部类）
-	class Thread
-	{
-	public:
-		Thread(ThreadPool * threadPool);
-		~Thread();
+	if (minNumOfThread < 2)
+		this->minNumOfThread = 2;
+	else
+		this->minNumOfThread = minNumOfThread;
 
-		BOOL isBusy();//是否有任务在执行
-		void ExecuteTask(TaskFun task, PVOID param, TaskCallbackFun taskCallback); //执行任务
-	private:
-		ThreadPool *threadPool;	//所属线程池
-		BOOL	busy;				//是否有任务在执行
-		BOOL	exit;				//是否退出
-		HANDLE  thread;			//线程句柄
-		TaskFun task;			//要执行的任务
-		PVOID	param;			//任务参数
-		TaskCallbackFun		taskCb;	//回调的任务
-		static unsigned int __stdcall ThreadProc(PVOID pM);	//线程函数
-	};
+	if (maxNumOfThread < this->minNumOfThread * 2)
+		this->maxNumOfThread = this->minNumOfThread * 2;
+	else
+		this->maxNumOfThread = maxNumOfThread;
 
-	//IOCP的通知种类
-	enum WAIT_OPERATION_TYPE
-	{
-		GET_TASK,
-		EXIT
-	};
+	stopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+	completionPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
 
-	//待执行的任务类
-	class WaitTask
+	//清空空闲线程列表
+	idleThreadList.clear();
+	//创建空闲线程
+	CreateIdleThread(this->minNumOfThread);
+
+	busyThreadList.clear();
+
+	dispatchThrad = (HANDLE)_beginthreadex(0, 0, GetTaskThreadProc, this, 0, 0);
+
+	numOfLongFun = 0;
+}
+ThreadPool::~ThreadPool()
+{
+	SetEvent(stopEvent);
+	PostQueuedCompletionStatus(completionPort, 0, (DWORD)EXIT, NULL);
+	CloseHandle(stopEvent);
+}
+BOOL ThreadPool::QueueTaskItem(TaskFun task, PVOID param, TaskCallbackFun taskCb, BOOL longFun)
+{
+	waitTaskLock.Lock();
+	WaitTask *waitTask = new WaitTask(task, param, taskCb, longFun);
+	waitTaskList.push_back(waitTask);
+	PostQueuedCompletionStatus(completionPort, 0, (DWORD)GET_TASK, NULL);
+	waitTaskLock.UnLock();
+	return TRUE;
+}
+void ThreadPool::CreateIdleThread(size_t size)
+{
+	idleThreadLock.Lock();
+	for (size_t i = 0; i < size; ++i)
 	{
-	public:
-		WaitTask(TaskFun task, PVOID param, TaskCallbackFun taskCb, BOOL bLong)
+		idleThreadList.push_back(new Thread(this));
+	}
+	idleThreadLock.UnLock();
+}
+void ThreadPool::DeleteIdleThread(size_t size)
+{
+	idleThreadLock.Lock();
+	size_t t = idleThreadList.size();
+	//如果想要删除的线程数小于总的线程数量，按传入的数量删，如果比总的线程数量大则将列表全部删除
+	//删除从尾部开始删除
+	if (t >= size)
+	{
+		for (size_t i = 0; i < size; ++i)
 		{
-			this->task = task;
-			this->param = param;
-			this->taskCb = taskCb;
-			this->bLong = bLong;
+			auto thread = idleThreadList.back();
+			delete thread;
+			idleThreadList.pop_back();
 		}
-		~WaitTask()
-		{
-			task = NULL;
-			taskCb = NULL;
-			bLong = FALSE;
-			param = NULL;
-		}
-
-		TaskFun		task;	//要执行的任务
-		PVOID		param;	//任务参数
-		TaskCallbackFun		taskCb;		//回调的任务
-		BOOL		bLong;	//是否时长任务
-	};
-
-	//从任务列表取任务的线程函数
-	static unsigned int __stdcall GetTaskThreadProc(PVOID pM)
+	}
+	else
 	{
-		ThreadPool *threadPool = (ThreadPool *)pM;
-		BOOL bRet = FALSE;
-		DWORD dwBytes = 0;
-		WAIT_OPERATION_TYPE opType;
-		OVERLAPPED *ol;
-		while (WAIT_OBJECT_0 != WaitForSingleObject(threadPool->stopEvent, 0))
+		for (size_t i = 0; i < t; ++i)
 		{
-			BOOL bRet = GetQueuedCompletionStatus(threadPool->completionPort, &dwBytes,
-				(PULONG_PTR)&opType, &ol, INFINITE);
-			//收到退出标志
-			if (EXIT == (DWORD)opType)
-			{
-				break;
-			}
-			else if (GET_TASK == (DWORD)opType)
-			{
-				threadPool->GetTaskExcute();
-			}
+			auto thread = idleThreadList.back();
+			delete thread;
+			idleThreadList.pop_back();
 		}
-		return 0;
+	}
+	idleThreadLock.UnLock();
+}
+ThreadPool::Thread *ThreadPool::GetIdleThread()
+{
+	Thread *thread = NULL;
+	idleThreadLock.Lock();
+	//获取从头部开始获取
+	if (idleThreadList.size() > 0)
+	{
+		thread = idleThreadList.front();
+		idleThreadList.pop_front();
+	}
+	idleThreadLock.UnLock();
+
+	if (thread == NULL && getCurNumOfThread() < maxNumOfThread)
+	{
+		thread = new Thread(this);
 	}
 
-	//线程临界区锁
-	class CriticalSectionLock
+	if (thread == NULL && waitTaskList.size() > THRESHOLE_OF_WAIT_TASK)
 	{
-	private:
-			CRITICAL_SECTION cs;//临界区
-	public:
-			CriticalSectionLock() { InitializeCriticalSection(&cs); }
-			~CriticalSectionLock() { DeleteCriticalSection(&cs); }
-			void Lock() { EnterCriticalSection(&cs); }
-			void UnLock() { LeaveCriticalSection(&cs); }
-	};
-
-public:
-	ThreadPool(size_t minNumOfThread = 2, size_t maxNumOfThread = 10);
-	~ThreadPool();
-
-	BOOL QueueTaskItem(TaskFun task, PVOID param, TaskCallbackFun taskCb = NULL, BOOL longFun = FALSE);	//任务入队
-private:
-	size_t getCurNumOfThread() { return getIdleThreadNum() + getBusyThreadNum(); }    // 获取线程池中的当前线程数
-	size_t GetMaxNumOfThread() { return maxNumOfThread - numOfLongFun; }            // 获取线程池中的最大线程数
-	void SetMaxNumOfThread(size_t size)            // 设置线程池中的最大线程数
-	{
-		if (size < numOfLongFun)
-		{
-			 maxNumOfThread = size + numOfLongFun;
-		}
-		else
-			maxNumOfThread = size;
+		thread = new Thread(this);
+		InterlockedIncrement(&maxNumOfThread);
 	}
-	size_t GetMinNumOfThread() { return minNumOfThread; }                            // 获取线程池中的最小线程数
-	void SetMinNumOfThread(size_t size) { minNumOfThread = size; }                    // 设置线程池中的最小线程数
-	size_t getIdleThreadNum() { return idleThreadList.size(); }    // 获取线程池中的线程数
-	size_t getBusyThreadNum() { return busyThreadList.size(); }    // 获取线程池中的线程数
-	void CreateIdleThread(size_t size);                            // 创建空闲线程
-	void DeleteIdleThread(size_t size);                            // 删除空闲线程
-	Thread *GetIdleThread();                                    // 获取空闲线程
-	void MoveBusyThreadToIdleList(Thread *busyThread);            // 忙碌线程加入空闲列表
-	void MoveThreadToBusyList(Thread *thread);                    // 线程加入忙碌列表
-	void GetTaskExcute();                                        // 从任务队列中取任务执行
-	WaitTask *GetTask();                                        // 从任务队列中取任务
-	CriticalSectionLock idleThreadLock;                            // 空闲线程列表锁
-	list<Thread *> idleThreadList;                                // 空闲线程列表
-	CriticalSectionLock busyThreadLock;                            // 忙碌线程列表锁
-	list<Thread *> busyThreadList;                                // 忙碌线程列表
-	CriticalSectionLock waitTaskLock;
-	list<WaitTask *> waitTaskList;                                // 任务列表
-	HANDLE                    dispatchThrad;                        // 分发任务线程
-	HANDLE                    stopEvent;                            // 通知线程退出的时间
-	HANDLE                    completionPort;                        // 完成端口
-	size_t                    maxNumOfThread;                        // 线程池中最大的线程数
-	size_t                    minNumOfThread;                        // 线程池中最小的线程数
-	size_t                    numOfLongFun;                        // 线程池中最小的线程数
-};
+	return thread;
+}
+void ThreadPool::MoveBusyThreadToIdleList(Thread * busyThread)
+{
+	//将线程加入空闲列表
+	idleThreadLock.Lock();
+	idleThreadList.push_back(busyThread);
+	idleThreadLock.UnLock();
+	//删除忙碌线程列表中的该线程
+	busyThreadLock.Lock();
+	for (auto it = busyThreadList.begin(); it != busyThreadList.end(); ++it)
+	{
+		if (*it = busyThread)
+		{
+			busyThreadList.erase(it);
+			break;
+		}
+	}
+	busyThreadLock.UnLock();
+	//如果线程池内线程数不为0 && 空闲线程列表中的数量 > 线程池内线程数的8成，则将空闲线程列表中的一半删除
+	if (maxNumOfThread != 0 && idleThreadList.size() > maxNumOfThread * 0.8)
+	{
+		DeleteIdleThread(idleThreadList.size() / 2);
+	}
+
+	PostQueuedCompletionStatus(completionPort, 0, (DWORD)GET_TASK, NULL);
+}
+void ThreadPool::MoveThreadToBusyList(Thread * thread)
+{
+	busyThreadLock.Lock();
+	busyThreadList.push_back(thread);
+	busyThreadLock.UnLock();
+}
